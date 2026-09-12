@@ -13,15 +13,11 @@ Assistant or the Keep app and it flows to the other side within one poll
 interval (60 seconds by default).
 
 > [!IMPORTANT]
-> The official Keep API has no way to update a note or an item in place -
-> only create, list, get, and delete whole notes. So **every change is
-> implemented as delete-and-recreate**: this integration rebuilds the full
-> item list and creates a brand new note, then deletes the old one. Two
-> consequences of that are worth knowing up front:
-> - **Checking an item off deletes it** - there's no way to persist
->   "checked" state through a delete+recreate cycle.
-> - **Items have no stable ID**, so Home Assistant identifies each item by
->   a hash of its text - keep item text unique within a list.
+> **Every change is implemented as delete-and-recreate**:
+> this integration rebuilds the full item list and creates a brand new note,
+> then deletes the old one. 
+> - **Checking an item off deletes it**
+> - **Items have no stable ID**
 >
 > See [section 4](#4-how-the-sync-works--limitations) for the full
 > explanation and other limitations.
@@ -29,7 +25,7 @@ interval (60 seconds by default).
 ## 2. Installation
 
 ### HACS (custom repository)
-1. HACS → Integrations → ⋮ → Custom repositories → add this repository's
+1. HACS → ⋮ → Custom repositories → add this repository's
    URL as an "Integration".
 2. Install "Google Keep Todo Sync", then restart Home Assistant.
 
