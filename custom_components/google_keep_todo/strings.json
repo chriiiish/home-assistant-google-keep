@@ -1,53 +1,53 @@
 {
   "config": {
     "step": {
-      "pick_implementation": {
-        "title": "Pick authentication method"
+      "user": {
+        "title": "Connect to Google Keep",
+        "description": "Enter the Google account email and master token to use for syncing. We strongly recommend creating a dedicated Google account for this and sharing your Keep lists with it, rather than using your primary account, since the master token grants full access to that account.",
+        "data": {
+          "email": "Email",
+          "master_token": "Master token"
+        }
       },
       "lists": {
         "title": "Choose lists to sync",
-        "description": "Enter the Google Keep list names to sync, separated by commas (e.g. `Groceries, Chores`). Each becomes a Home Assistant to-do list. If a list with that title doesn't exist yet in Keep, it will be created.",
+        "description": "Select which Google Keep lists should be synced as Home Assistant to-do lists.",
         "data": {
-          "list_titles": "List titles"
+          "list_ids": "Lists"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Google Keep",
+        "description": "The master token for {email} is no longer valid. Enter a new one.",
+        "data": {
+          "master_token": "Master token"
         }
       }
     },
     "error": {
-      "no_lists_selected": "Enter at least one list title."
+      "invalid_auth": "Unable to authenticate. Double-check the email and master token.",
+      "no_lists": "No lists were found on this Google Keep account.",
+      "no_lists_selected": "Select at least one list to sync.",
+      "unknown": "Unexpected error, see the Home Assistant log for details."
     },
     "abort": {
       "already_configured": "This Google account is already configured.",
-      "cannot_connect": "Could not reach Google to look up the account's email address.",
-      "missing_configuration": "The integration is not configured. Set up an OAuth application credential first (see the README).",
-      "missing_credentials": "You need an application credential configured before adding this integration - see the README for how to register one in Google Cloud Console.",
-      "oauth_error": "Received invalid token data.",
-      "oauth_failed": "Error while obtaining access token.",
-      "oauth_timeout": "Timeout resolving OAuth token.",
-      "oauth_unauthorized": "Google rejected the authorization.",
-      "user_rejected_authorize": "Account linking rejected: {error}",
-      "reauth_successful": "Re-authentication was successful.",
-      "unique_id_mismatch": "The re-authenticated account does not match the original account."
-    },
-    "create_entry": {
-      "default": "Successfully authenticated with Google Keep."
+      "reauth_successful": "Re-authentication was successful."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Google Keep sync options",
-        "description": "Enter the Google Keep list names to sync, separated by commas.",
         "data": {
-          "list_titles": "List titles",
+          "list_ids": "Lists",
           "scan_interval": "Poll interval"
         }
       }
     },
     "error": {
-      "no_lists_selected": "Enter at least one list title."
+      "invalid_auth": "Unable to authenticate. Double-check the master token in the integration's settings.",
+      "unknown": "Unexpected error, see the Home Assistant log for details."
     }
-  },
-  "application_credentials": {
-    "description": "To link your Google account, you need an OAuth client registered in Google Cloud Console with the Google Keep API enabled:\n1. Go to the [Google Cloud Console credentials page]({oauth_creds_url}) and create an OAuth client ID of type 'Web application', with redirect URI `https://my.home-assistant.io/redirect/oauth`.\n2. Enable the [Keep API]({keep_api_url}) for that project.\n3. On the [OAuth consent screen]({oauth_consent_url}), add scope `https://www.googleapis.com/auth/keep`, add your Google account as a test user, then set publishing status to **In production** (this avoids Google's 7-day token expiry for apps left in Testing - you'll still see an 'unverified app' warning to click through, which is expected for a personal-use app under 100 users).\n4. Enter the Client ID and Client Secret from step 1 below."
   }
 }

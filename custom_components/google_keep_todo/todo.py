@@ -1,25 +1,20 @@
 """Todo platform for Google Keep Todo Sync.
 
-The Google Keep REST API has no per-item id and no update/patch method, so
-every mutation is expressed as "the full new list of item texts" and pushed
-via `coordinator.async_replace_items`, which recreates the whole note (see
-coordinator.py). Two consequences of that, both accepted trade-offs for
-using the official API instead of an unofficial master-token client:
-
-- Checking an item off is treated as deleting it - there's nowhere to
-  durably store "checked" state across a create+delete cycle other than
-  dropping the item, which also matches how a disposable checklist is
-  normally used.
-- Items have no server-assigned id, so a uid is derived from the item text
-  itself. Two items with identical text in the same list are indistinguishable
-  and will collide - keep item text unique within a list.
+Each selected Google Keep list is exposed as one Home Assistant `todo` list
+entity. Google Keep supports one level of sub-item nesting that the HA
+`todo` platform has no equivalent for, so nested checklist items are not
+shown here and are left untouched on the Keep side.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
 
+from gkeepapi.node import (
+    List as KeepList,
+    ListItem as KeepListItem,
+    NewListItemPlacementValue,
+)
 from homeassistant.components.todo import (
     TodoItem,
     TodoItemStatus,
@@ -38,10 +33,6 @@ from .coordinator import GoogleKeepUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 
-def _uid_for_text(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]  # noqa: S324 - identity, not security
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -50,12 +41,12 @@ async def async_setup_entry(
     """Set up Google Keep todo list entities for a config entry."""
     coordinator: GoogleKeepUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
-        GoogleKeepTodoListEntity(coordinator, title) for title in coordinator.list_titles
+        GoogleKeepTodoListEntity(coordinator, list_id) for list_id in coordinator.list_ids
     )
 
 
 class GoogleKeepTodoListEntity(CoordinatorEntity[GoogleKeepUpdateCoordinator], TodoListEntity):
-    """A Home Assistant todo list backed by a Google Keep checklist note."""
+    """A Home Assistant todo list backed by a Google Keep list."""
 
     _attr_has_entity_name = True
     _attr_supported_features = (
@@ -65,81 +56,129 @@ class GoogleKeepTodoListEntity(CoordinatorEntity[GoogleKeepUpdateCoordinator], T
         | TodoListEntityFeature.MOVE_TODO_ITEM
     )
 
-    def __init__(self, coordinator: GoogleKeepUpdateCoordinator, title: str) -> None:
-        """Initialize the entity for a single Keep list title."""
+    def __init__(self, coordinator: GoogleKeepUpdateCoordinator, list_id: str) -> None:
+        """Initialize the entity for a single Keep list id."""
         super().__init__(coordinator)
-        self._title = title
-        self._attr_name = title
-        self._attr_unique_id = f"{coordinator.entry.entry_id}_{title}"
+        self._list_id = list_id
+        self._attr_unique_id = f"{coordinator.entry.entry_id}_{list_id}"
 
     @property
-    def _texts(self) -> list[str]:
-        if self.coordinator.data is None:
-            return []
-        return self.coordinator.data.get(self._title, [])
+    def _keep_list(self) -> KeepList | None:
+        return self.coordinator.data.get(self._list_id) if self.coordinator.data else None
 
     @property
-    def todo_items(self) -> list[TodoItem]:
-        """Return active items. Checked items don't exist here - see module docstring."""
+    def name(self) -> str:
+        """Return the current Keep list title."""
+        keep_list = self._keep_list
+        return keep_list.title if keep_list is not None else "Google Keep list"
+
+    @property
+    def available(self) -> bool:
+        """Entity is unavailable if the list was deleted/unshared remotely."""
+        return super().available and self._keep_list is not None
+
+    @property
+    def todo_items(self) -> list[TodoItem] | None:
+        """Return top-level (non-indented) items in Keep's display order."""
+        keep_list = self._keep_list
+        if keep_list is None:
+            return None
         return [
             TodoItem(
-                uid=_uid_for_text(text),
-                summary=text,
-                status=TodoItemStatus.NEEDS_ACTION,
+                uid=item.id,
+                summary=item.text,
+                status=(TodoItemStatus.COMPLETED if item.checked else TodoItemStatus.NEEDS_ACTION),
             )
-            for text in self._texts
+            for item in keep_list.items
+            if not item.indented
         ]
 
-    def _index_for_uid(self, texts: list[str], uid: str) -> int | None:
-        for index, text in enumerate(texts):
-            if _uid_for_text(text) == uid:
-                return index
+    def _top_level_items(self, keep_list: KeepList) -> list[KeepListItem]:
+        return [item for item in keep_list.items if not item.indented]
+
+    def _find_item(self, uid: str) -> KeepListItem | None:
+        keep_list = self._keep_list
+        if keep_list is None:
+            return None
+        for item in self._top_level_items(keep_list):
+            if item.id == uid:
+                return item
         return None
 
     async def async_create_todo_item(self, item: TodoItem) -> None:
-        """Add a new item to the bottom of the list."""
-        texts = [*self._texts, item.summary or ""]
-        await self.coordinator.async_replace_items(self._title, texts)
+        """Create a new item on the Keep list."""
+
+        def _create() -> None:
+            keep_list = self._keep_list
+            if keep_list is None:
+                raise HomeAssistantError("Google Keep list is not available")
+            keep_list.add(
+                item.summary or "",
+                checked=item.status == TodoItemStatus.COMPLETED,
+                sort=NewListItemPlacementValue.Bottom,
+            )
+
+        await self.coordinator.async_execute(_create)
 
     async def async_update_todo_item(self, item: TodoItem) -> None:
-        """Rename an item, or remove it if it was marked completed."""
-        texts = list(self._texts)
-        index = self._index_for_uid(texts, item.uid)
-        if index is None:
-            raise HomeAssistantError(f"Todo item {item.uid} not found")
+        """Update an existing item's text and/or completion state."""
 
-        if item.status == TodoItemStatus.COMPLETED:
-            texts.pop(index)
-        elif item.summary is not None:
-            texts[index] = item.summary
+        def _update() -> None:
+            keep_item = self._find_item(item.uid)
+            if keep_item is None:
+                raise HomeAssistantError(f"Todo item {item.uid} not found")
+            if item.summary is not None:
+                keep_item.text = item.summary
+            if item.status is not None:
+                keep_item.checked = item.status == TodoItemStatus.COMPLETED
 
-        await self.coordinator.async_replace_items(self._title, texts)
+        await self.coordinator.async_execute(_update)
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
-        """Delete one or more items from the list."""
-        texts = list(self._texts)
-        remove_indexes = set()
-        for uid in uids:
-            index = self._index_for_uid(texts, uid)
-            if index is not None:
-                remove_indexes.add(index)
-        texts = [text for i, text in enumerate(texts) if i not in remove_indexes]
-        await self.coordinator.async_replace_items(self._title, texts)
+        """Delete one or more items from the Keep list."""
+
+        def _delete() -> None:
+            for uid in uids:
+                keep_item = self._find_item(uid)
+                if keep_item is not None:
+                    keep_item.delete()
+
+        await self.coordinator.async_execute(_delete)
 
     async def async_move_todo_item(self, uid: str, previous_uid: str | None = None) -> None:
         """Reorder an item to sit immediately after `previous_uid` (or first)."""
-        texts = list(self._texts)
-        index = self._index_for_uid(texts, uid)
-        if index is None:
-            raise HomeAssistantError(f"Todo item {uid} not found")
-        text = texts.pop(index)
 
-        if previous_uid is None:
-            texts.insert(0, text)
-        else:
-            prev_index = self._index_for_uid(texts, previous_uid)
-            if prev_index is None:
-                raise HomeAssistantError(f"Todo item {previous_uid} not found")
-            texts.insert(prev_index + 1, text)
+        def _move() -> None:
+            keep_list = self._keep_list
+            if keep_list is None:
+                raise HomeAssistantError("Google Keep list is not available")
 
-        await self.coordinator.async_replace_items(self._title, texts)
+            items = self._top_level_items(keep_list)
+            moving = next((i for i in items if i.id == uid), None)
+            if moving is None:
+                raise HomeAssistantError(f"Todo item {uid} not found")
+
+            remaining = [i for i in items if i.id != uid]
+            index = 0
+            if previous_uid is not None:
+                prev_index = next(
+                    (idx for idx, i in enumerate(remaining) if i.id == previous_uid),
+                    None,
+                )
+                if prev_index is None:
+                    raise HomeAssistantError(f"Todo item {previous_uid} not found")
+                index = prev_index + 1
+
+            # `items` is sorted highest-sort-first (Keep's display order), so
+            # the item before the target position has the higher sort value.
+            prev_item = remaining[index - 1] if index > 0 else None
+            next_item = remaining[index] if index < len(remaining) else None
+
+            if prev_item is not None and next_item is not None:
+                moving.sort = (prev_item.sort + next_item.sort) // 2
+            elif prev_item is not None:
+                moving.sort = prev_item.sort - KeepList.SORT_DELTA
+            elif next_item is not None:
+                moving.sort = next_item.sort + KeepList.SORT_DELTA
+
+        await self.coordinator.async_execute(_move)

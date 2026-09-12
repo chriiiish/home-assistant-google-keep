@@ -1,100 +1,80 @@
-"""Minimal async client for the official Google Keep REST API.
+"""Thin synchronous wrapper around gkeepapi.
 
-The API only exposes notes.create / notes.get / notes.list / notes.delete -
-there is no update/patch method for a note or for individual list items.
-Every local change is therefore implemented as "build the full desired item
-list, create a new note with it, delete the old note" (see coordinator.py).
+Google's own Keep API only grants its OAuth scopes to Google Workspace
+accounts, not personal @gmail.com accounts (confirmed by
+`invalid_scope` errors when the scope isn't even selectable on a personal
+project's OAuth consent screen). For a personal account, gkeepapi - an
+unofficial client authenticated with a Google master token - is the only
+option. It's entirely blocking (it uses `requests` under the hood), so
+every public method on GoogleKeepApi is blocking too. Callers (the
+coordinator and todo entities) are responsible for running these through
+`hass.async_add_executor_job`; nothing in this module may be awaited
+directly.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import logging
 
-from homeassistant.helpers import config_entry_oauth2_flow
+import gkeepapi
+from gkeepapi.exception import LoginException
+from gkeepapi.node import List as KeepList
 
-from .const import API_BASE_URL, USERINFO_URL
-
-
-class GoogleKeepApiError(Exception):
-    """Raised when a Google Keep API call fails."""
+_LOGGER = logging.getLogger(__name__)
 
 
-class GoogleKeepRestApi:
-    """Thin async wrapper around the Google Keep REST API."""
-
-    def __init__(self, oauth_session: config_entry_oauth2_flow.OAuth2Session) -> None:
-        self._session = oauth_session
-
-    async def async_get_email(self) -> str:
-        """Return the authenticated user's email address."""
-        resp = await self._session.async_request("GET", USERINFO_URL)
-        await _raise_for_status(resp)
-        data = await resp.json()
-        return data["email"]
-
-    async def async_list_notes(self) -> list[dict[str, Any]]:
-        """Return every non-trashed note in the account (all pages)."""
-        notes: list[dict[str, Any]] = []
-        page_token: str | None = None
-        while True:
-            params = {"pageSize": "100", "filter": "trashed=false"}
-            if page_token:
-                params["pageToken"] = page_token
-            resp = await self._session.async_request("GET", f"{API_BASE_URL}/notes", params=params)
-            await _raise_for_status(resp)
-            data = await resp.json()
-            notes.extend(data.get("notes", []))
-            page_token = data.get("nextPageToken")
-            if not page_token:
-                break
-        return notes
-
-    async def async_create_list_note(self, title: str, item_texts: list[str]) -> dict[str, Any]:
-        """Create a new checklist note with the given title and item texts."""
-        body = {
-            "title": title,
-            "body": {
-                "list": {
-                    "listItems": [{"text": {"text": text}, "checked": False} for text in item_texts]
-                }
-            },
-        }
-        resp = await self._session.async_request("POST", f"{API_BASE_URL}/notes", json=body)
-        await _raise_for_status(resp)
-        return await resp.json()
-
-    async def async_delete_note(self, name: str) -> None:
-        """Delete a note by its resource name (e.g. 'notes/abc123')."""
-        resp = await self._session.async_request("DELETE", f"{API_BASE_URL}/{name}")
-        if resp.status == 404:
-            return
-        await _raise_for_status(resp)
+class GoogleKeepAuthError(Exception):
+    """Raised when authentication with Google Keep fails."""
 
 
-async def _raise_for_status(resp) -> None:
-    if resp.status >= 400:
-        text = await resp.text()
-        raise GoogleKeepApiError(f"HTTP {resp.status} from Google Keep API: {text}")
+class GoogleKeepApi:
+    """Blocking wrapper around a single gkeepapi.Keep session."""
 
+    def __init__(self, email: str, master_token: str, device_id: str) -> None:
+        self._email = email
+        self._master_token = master_token
+        self._device_id = device_id
+        self.keep = gkeepapi.Keep()
 
-def top_level_item_texts(note: dict[str, Any]) -> list[str]:
-    """Extract active (unchecked, non-nested) item texts from a note, in order.
+    def authenticate(self, state: dict | None = None) -> None:
+        """Authenticate using the stored master token, optionally resuming from cached state."""
+        try:
+            self.keep.authenticate(
+                self._email,
+                self._master_token,
+                state=state,
+                device_id=self._device_id,
+            )
+        except LoginException as err:
+            raise GoogleKeepAuthError(str(err)) from err
 
-    Checked items are dropped: this integration treats "checked" the same as
-    "deleted" in both directions, since the API can't preserve per-item state
-    across the create+delete cycle any other way. Nested sub-items (Keep's
-    one level of checklist indentation) have no equivalent in Home
-    Assistant's flat todo model and are dropped too.
-    """
-    items = note.get("body", {}).get("list", {}).get("listItems", [])
-    texts = []
-    for item in items:
-        if item.get("checked"):
-            continue
-        texts.append(item.get("text", {}).get("text", ""))
-    return texts
+    def sync(self) -> None:
+        """Push local changes and pull remote changes."""
+        try:
+            self.keep.sync()
+        except gkeepapi.exception.ResyncRequiredException:
+            _LOGGER.warning("Google Keep requested a full resync")
+            self.keep.sync(resync=True)
 
+    def dump(self) -> dict:
+        """Serialize local Keep state so a restart doesn't require a full resync."""
+        return self.keep.dump()
 
-def is_list_note(note: dict[str, Any]) -> bool:
-    """Return whether a note is a checklist note (vs. a plain text note)."""
-    return "list" in note.get("body", {})
+    def get_lists(self) -> list[KeepList]:
+        """Return all non-trashed, non-archived Keep lists known locally."""
+        return [
+            node
+            for node in self.keep.all()
+            if isinstance(node, KeepList) and not node.trashed and not node.archived
+        ]
+
+    def get_list(self, list_id: str) -> KeepList | None:
+        """Look up a single Keep list by id."""
+        node = self.keep.get(list_id)
+        if isinstance(node, KeepList) and not node.trashed:
+            return node
+        return None
+
+    def create_list(self, title: str) -> KeepList:
+        """Create a new Keep list."""
+        return self.keep.createList(title)

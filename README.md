@@ -5,22 +5,23 @@
 ![Google Keep Todo Sync screenshot](docs/screenshot.png)
 <!-- TODO: replace with a real screenshot of a synced todo.* entity in the Home Assistant UI -->
 
-Two-way sync between Google Keep lists and Home Assistant `todo` lists,
-using Google's **official** Keep API over standard OAuth2 - no master
-token, no dedicated Google account, no unofficial/reverse-engineered
-client. Add, check off, rename, delete, or reorder items from either Home
-Assistant or the Keep app and it flows to the other side within one poll
-interval (60 seconds by default).
+Two-way sync between Google Keep lists and Home Assistant `todo` lists.
+Create, check off, edit, delete, or reorder items on either side and it
+flows to the other within one poll interval (60 seconds by default).
+
+This uses [`gkeepapi`](https://github.com/kiwiz/gkeepapi), an unofficial
+Google Keep client. Google's *official* Keep API only grants its OAuth
+scopes to Google Workspace accounts - a personal `@gmail.com` account
+cannot use it at all (confirmed by an `invalid_scope` error: the scope
+isn't even selectable on a personal project's OAuth consent screen). For a
+personal account, `gkeepapi` is the only way to automate Keep at all, and
+it authenticates with a Google **master token** instead of your normal
+password/2FA - a token with full account access which, once you have it,
+does not expire on its own.
 
 > [!IMPORTANT]
-> **Every change is implemented as delete-and-recreate**:
-> this integration rebuilds the full item list and creates a brand new note,
-> then deletes the old one. 
-> - **Checking an item off deletes it**
-> - **Items have no stable ID**
->
-> See [section 4](#4-how-the-sync-works--limitations) for the full
-> explanation and other limitations.
+> A master token grants full access to the associated Google account, not
+> just Keep. See the security recommendation below before setting this up.
 
 ## 2. Installation
 
@@ -35,85 +36,96 @@ Copy `custom_components/google_keep_todo` into your Home Assistant
 
 ## 3. Configuration
 
-### Step 1: Create a Google Cloud OAuth client (one-time)
+### Step 1: Use a dedicated Google account (strongly recommended)
 
-Google Keep has no official Home Assistant app to authorize against, so you
-register your own:
+Because a master token grants full access to the associated Google account
+(not just Keep), **do not use your primary Google account**. Instead:
 
-1. Create or pick a project in the [Google Cloud Console](https://console.cloud.google.com/).
-2. Enable the [Keep API](https://console.cloud.google.com/apis/library/keep.googleapis.com)
-   for that project.
-3. Go to **APIs & Services → OAuth consent screen**:
-   - Add the scope `https://www.googleapis.com/auth/keep`.
-   - Add your own Google account as a **test user**.
-   - Set publishing status to **In production** (leaving it in "Testing"
-     causes Google to expire your refresh token every 7 days, which would
-     silently break the integration on a weekly basis). This is safe for
-     personal use with under 100 users - Google will still show an
-     "unverified app" warning the first time you authorize, which you click
-     through; full verification (and the security assessment it requires)
-     is not needed at this scale.
-4. Go to **APIs & Services → Credentials → Create Credentials → OAuth
-   client ID**, type **Web application**, and add
-   `https://my.home-assistant.io/redirect/oauth` as an authorized redirect
-   URI (add your own instance's `<url>/auth/external/callback` too if you
-   don't use My Home Assistant redirects).
-5. Note the Client ID and Client Secret.
+1. Create a new, dedicated Google account just for this integration.
+2. In Google Keep, share the list(s) you want to sync from your main account
+   with that new account's email address (Keep's "Collaborator" sharing).
+3. Obtain the master token for the **new** account (see below) and use that
+   account's email/token in this integration's setup.
 
-### Step 2: Add the application credential in Home Assistant
+This way, if the token is ever leaked, only a throwaway account with access
+to a handful of shared lists is exposed - not your primary Google identity.
 
-1. Settings → Devices & Services → Application Credentials → Add →
-   select **Google Keep Todo Sync**, and enter the Client ID/Secret from
-   step 1.
+### Step 2: Obtain a master token
+
+`gkeepapi` cannot log in with just a password anymore - Google blocks that
+as suspicious. The easiest way to get a master token is a small community
+Docker tool that automates the browser-login exchange:
+
+```
+docker run -it --rm breph/ha-google-home_get-token:latest python3 get_tokens.py
+```
+
+Run this on a separate machine from Home Assistant (any Linux box, or
+Windows via WSL) and follow its prompts to sign in to the **dedicated**
+account. It prints a master token (starts with `aas_et/`) - copy the whole
+thing.
+
+<details>
+<summary>Manual alternative, if you'd rather not use Docker</summary>
+
+1. Log in to the dedicated Google account in a private/incognito browser
+   window at `https://accounts.google.com/EmbeddedSetup`, completing any
+   2FA prompts.
+2. Open DevTools → Application/Storage → Cookies, and copy the value of the
+   `oauth_token` cookie for `accounts.google.com`.
+3. Run:
+   ```python
+   import gpsoauth
+   android_id = "0000000000000000"  # any stable 16-hex-digit string; keep it
+   email = "your-dedicated-account@gmail.com"
+   oauth_token = "the cookie value from step 2"
+   master_response = gpsoauth.exchange_token(email, oauth_token, android_id)
+   print(master_response["Token"])
+   ```
+</details>
+
+Save the token somewhere safe. You will not need to repeat this unless it's
+revoked (e.g. you change the dedicated account's password).
 
 ### Step 3: Add the integration
 
 1. Settings → Devices & Services → Add Integration → **Google Keep Todo
-   Sync**, and complete the Google sign-in/consent flow.
-2. Enter the Keep list titles to sync, comma-separated (e.g.
-   `Groceries, Chores`). Each becomes its own `todo.*` entity. If a list
-   with that title doesn't already exist in Keep, it's created empty.
+   Sync**.
+2. Enter the dedicated account's email and the master token from step 2.
+3. Select which Keep lists to sync. Each becomes its own `todo.*` entity.
 
 ### Changing settings later
 
-Use the integration's **Configure** option to change which list titles are
-synced or adjust the poll interval (default 60s; the API has no push
-mechanism, so lower values just mean more frequent polling - 30s is the
+Use the integration's **Configure** option to change which lists are
+synced or adjust the poll interval (default 60s; Keep has no push API, so
+lower values increase the number of requests made to Google - 30s is the
 practical floor).
 
 ## 4. How the sync works & limitations
 
-- Home Assistant polls Google Keep every `scan_interval` seconds for the
-  current state of each synced list (matched by title).
-- Any change from the Home Assistant `todo` UI/API (add, rename, check off,
-  delete, reorder) is pushed immediately: the full new item list is written
-  to a newly created note, and the previous note is deleted.
-- A Keep list is matched by **title**, not by its underlying note ID -
-  every recreation gets a new ID, so keep each synced list's title unique
-  in the account.
-- Nested/indented Keep checklist sub-items have no equivalent in Home
-  Assistant's flat `todo` model and are dropped from what's shown in Home
-  Assistant (existing sub-items in Keep are left alone unless the parent
-  list is rewritten by a Home Assistant-side edit, at which point they are
-  not carried over).
-- No due dates or descriptions - Keep list items don't have them.
-- No durable "completed" state - checking an item off deletes it.
-- No stable per-item identity - duplicate item text within one list will
-  collide.
-- Every write recreates the whole note, so collaborators viewing the note
-  in the Keep app will see it "flicker" (old note gone, new one appears)
-  rather than an in-place edit.
-
-If you need real per-item state (durable checked items, distinguishable
-duplicate text, etc.), that's only possible via the unofficial `gkeepapi`
-client and a Google master token - a materially different trust/security
-model that this integration deliberately avoids.
+- Home Assistant polls Google Keep every `scan_interval` seconds and pulls
+  down any remote changes.
+- Any change made from the Home Assistant `todo` UI/API (create, check off,
+  rename, delete, reorder) is applied to the local Keep list object
+  immediately and pushed to Google right away, not just on the next poll.
+- Conflicts are resolved by Google Keep's own sync protocol - the same
+  mechanism the official Keep apps use, so behavior matches what you'd see
+  syncing two Keep clients.
+- Google Keep supports one level of indented sub-items on a list; Home
+  Assistant's `todo` entity model is flat, so indented sub-items are not
+  shown in Home Assistant and are left untouched on the Keep side.
+- State (Keep's local node cache) is persisted across Home Assistant
+  restarts so it doesn't need a full resync every time it starts up - only
+  the master token needs to be entered once.
+- No due dates or descriptions - Google Keep list items don't have them.
+- This relies on an unofficial, reverse-engineered API. Google could change
+  or block it at any time. If your master token stops working, the
+  integration will prompt you to re-authenticate with a new one.
 
 ## 5. Development / Contribution
 
 Issues and pull requests are welcome - please open an issue first for
-anything beyond a small fix so we can agree on the approach, especially
-given the delete-and-recreate sync model's constraints described above.
+anything beyond a small fix so we can agree on the approach.
 
 If this integration is useful to you and you'd like to support its
 development:
