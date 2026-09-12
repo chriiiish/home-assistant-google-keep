@@ -1,0 +1,12 @@
+{
+  "domain": "google_keep_todo",
+  "name": "Google Keep Todo Sync",
+  "codeowners": ["@chriiiish"],
+  "config_flow": true,
+  "dependencies": ["application_credentials"],
+  "documentation": "https://github.com/chriiiish/home-assistant-google-keep",
+  "issue_tracker": "https://github.com/chriiiish/home-assistant-google-keep/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.2.0"
+}
